@@ -44,8 +44,8 @@ For our reproducibility study we used the following variables:
 library(readxl)
 library(brglm2)   # Firth penalized logistic regression
 library(pROC)     # ROC curves and AUC
-   
-
+library(dplyr)
+library(ggplot2)
 
 #import data -------------------------------------------------------------------------
 library(readxl)

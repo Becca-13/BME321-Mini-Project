@@ -1,0 +1,406 @@
+---
+title: "Bcells_Project"
+author: Rebecca 
+date: 04-30-2026
+toc: true
+toc-expand: true
+format:
+  html:
+    embed-resources: true
+    number-sections: true
+    code-fold: show
+    comments: 
+      hypothesis: true
+theme: flatly
+editor: visual
+editor_options:
+  chunk_output_type: console
+execute: 
+  echo: true
+  warning: false
+  error: false
+---
+
+## Session Preparation
+
+```{r}
+#| echo: false
+rm(list = ls(all.names = TRUE))
+```
+
+### Import Libraries
+
+```{r}
+#| echo: true
+
+library(pastecs)
+library(ggpubr)
+library(GGally)
+library(performance)
+library(DHARMa)
+library(car)
+library(ggeffects)
+library(ggplot2)
+library(knitr)
+library(dplyr)
+library(dagitty)
+library(broom)
+```
+
+## Introduction
+
+### Import Data
+
+```{r}
+#| echo: false
+
+cells <- read.csv("/Users/rebeccafelix/Desktop/Cohort11.csv", sep = ";")
+
+```
+
+### Data Wrangling
+
+Renaming Colums
+
+```{r}
+colnames(cells) <- c("id", "lymphocytes_count", "Tcd4_count", "Tcd8_count", "B_count", "OS_months", "TNM_stage", "response")
+```
+
+Removing first row, which was the column names of the original dataset
+
+```{r}
+cells <- cells[-1, ]
+```
+
+For the numeric variables, changing datatype from character to numeric value:
+
+```{r}
+cells <- cells %>%
+  mutate(
+    across(
+      c(lymphocytes_count, Tcd4_count, Tcd8_count, B_count, OS_months),
+      as.numeric
+    )
+  )
+```
+
+Adding some rows we need for the analysis:
+
+**T_count**: sum of CD4+ and CD8+ T cells
+
+```{r}
+cells <- cells %>%
+  mutate(T_count = Tcd4_count + Tcd8_count)
+```
+
+**stage**: simplified staging, derived from TNM_stage, categories are I, II/III, IV
+
+```{r}
+
+cells <- cells %>%
+  mutate(
+    stage = case_when(
+      grepl("^I[A-C]?$", TNM_stage, ignore.case = TRUE) ~ "I",
+      grepl("^(II|III)[A-C]?$", TNM_stage, ignore.case = TRUE) ~ "II/III",
+      grepl("^IV[A-C]?$", TNM_stage, ignore.case = TRUE) ~ "IV",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+**responder**: if patient responded to therapy, derived from response, CR & PR = responder, PD & SD = non responder
+
+```{r}
+cells <- cells %>%
+  mutate(
+    responder = case_when(
+      response %in% c("CR", "PR") ~ "responder",
+      response %in% c("PD", "SD") ~ "non_responder",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+### Data Overview
+
+The dataset contains `r nrow(cells)` patient samples. The variables are:
+
+-   Patient ID (`id`)
+-   Flow Cytometry Lymphocyte Count (`lymphocyte_count`)
+-   Flow Cytometry CD4+ T cell count (`Tcd4_count`)
+-   Flow Cytometry CD8+ T cell count (`Tcd8_count`)
+-   Flow Cytometry B cell count (`B_count`)
+-   Overall Survival of Patients in Months (`OS_months`)
+-   TNM Stage of the Tumor (`TNM_stage`)
+-   ICB RECIST Response (`response`)
+-   `T_count`: sum of CD4+ and CD8+ T cells
+-   `stage`: simplified staging, derived from `TNM_stage`; categories are I, II/III, IV
+-   `responder`: derived from `response`; CR & PR = responder, PD & SD = non-responder
+
+```{r}
+#| label: tbl_data_overview 
+#| tbl-cap: "First rows of the dataset"
+#| echo: true
+kable(head(cells), caption = "Table 1. First rows of the dataset.")
+```
+
+```{r}
+#| label: tbl_summary_stats 
+#| tbl-cap: "Summary statistics for the variables"
+#| echo: true
+kable(summary(cells), caption = "Table 2. Summary statistics for the variables.")
+```
+
+## Causal assumptions
+
+We suspect, that B cell abundance influences how well a patient responds to immunotherapy. We also assume that Tumor stage has an influence both on the therapy response as well as the b cell abundance. We therefore see the need to control for this variable.
+
+### DAG
+
+```{r}
+dag <- dagitty('
+
+dag {
+  "B cell abundance" [exposure, pos="-1,0"]
+  "Tumor Stage" [pos="0,1"]
+  Response [outcome, pos="1,0"]
+  "B cell abundance" -> Response
+  "Tumor Stage" -> "B cell abundance"
+  "Tumor Stage" -> Response
+}
+')
+plot(dag)
+```
+
+## Data Exploration
+
+### Checking relationship between B cell count and response
+
+```{r}
+ggplot(cells, aes(x = responder, y = B_count)) +
+  geom_boxplot(fill = "lightblue") +
+  geom_jitter(width = 0.2, alpha = 0.6) +
+  theme_minimal() +
+  labs(
+    title = "B cell abundance by response",
+    x = "Response group",
+    y = "B cell count"
+  )
+```
+
+### Confounder check:
+
+#### Does stage influence B cell count
+
+```{r}
+cells %>%
+  filter(!is.na(stage), !is.na(B_count)) %>%
+  ggplot(aes(x = stage, y = B_count)) +
+  geom_boxplot(fill = "lightgreen") +
+  geom_jitter(width = 0.2, alpha = 0.6) +
+  theme_minimal()
+```
+
+#### Does stage influence response
+
+```{r}
+cells_clean <- cells %>%
+  filter(!is.na(stage), !is.na(responder))
+counts <- cells_clean %>%
+  count(stage)
+ggplot(cells_clean, aes(x = stage, fill = responder)) +
+  geom_bar(position = "fill") +
+  geom_text(
+    data = counts,
+    aes(x = stage, y = 1.05, label = paste0("n=", n)),
+    inherit.aes = FALSE
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  labs( x = "Tumor stage", y = "Percentage of patients", fill = "Response Group") +
+  theme_minimal() 
+  
+```
+
+Unfortunately, there is only one datapoint for stage 1 tumors, which limits the information content of these graphs. Nevertheless, due to previous knowledge from the literature and based on our DAG, where `stage` is a fork, so we will control for it.
+
+## Model selection
+
+### Fit candidate models
+
+As our counts are skewed, we first want to log transform the B_count variable:
+
+```{r}
+cells <- cells %>%
+
+  mutate(log_B = log(B_count + 1))
+```
+
+Bc binomial glm needs 0/1 outcome:
+
+```{r}
+cells <- cells %>%
+  mutate(
+    responder = factor(responder, levels = c("non_responder", "responder"))
+  )
+```
+
+Make sure all models look at the same number of observations:
+
+```{r}
+cells_model <- cells %>%
+
+  filter(!is.na(responder), !is.na(log_B), !is.na(stage))
+```
+
+And then fit some candidate models:
+
+```{r}
+mod00 <- glm(responder ~ 1, data = cells_model, family = binomial)
+mod01 <- glm(responder ~ log_B, data = cells_model, family = binomial)
+mod02 <- glm(responder ~ log_B + stage, data = cells_model, family = binomial)
+mod03 <- glm(responder ~ log_B * stage, data = cells_model, family = binomial)
+```
+
+### Model comparison
+
+```{r}
+#| label: tbl-modelcomparison 
+#| tbl-cap: "Table for performance comparison of the candidate models"
+#| echo: true
+
+kable(compare_performance(mod00, mod01, mod02, mod03), digits= 3)
+```
+
+As can be seen in @tbl-modelcomparison, based solely on the weighted AIC values, mod01 performs better than mod02. However, as we identified `stage` as a confounding varable, leaving out the control will lead to a biased estimate. Therefore, we chose mod02 as our preferred model for the further analysis.
+
+### Validate preferred model
+
+```{r}
+check_model(mod02)
+```
+
+Having a look at odds ratios and confidence intervals:
+
+```{r}
+
+kable(tidy(mod02, exponentiate = TRUE, conf.int = TRUE))
+```
+
+This is a problem! Huge estimates and standard errors and the confidence intervals are NA or absurd, while the p values are extremely high.
+
+This is probably because we only have one value for stage I in the stage variable.
+
+We will therefore change the stage varibable into early stages (I,II,III) and late stage (IV).
+
+Collapse stages:
+
+```{r}
+cells_model <- cells_model %>%
+  mutate(stage2 = ifelse(stage == "IV", "IV", "I–III"))
+```
+
+Make it a factor again:
+
+```{r}
+cells_model <- cells_model %>%
+  mutate(stage2 = factor(stage2, levels = c("I–III", "IV")))
+```
+
+Fitting new model with`stage2` instead of `stage`.
+
+```{r}
+mod_final <- glm(
+  responder ~ log_B + stage2,
+  data = cells_model,
+  family = binomial
+)
+```
+
+### Validate final model
+
+```{r}
+check_model(mod_final)
+```
+
+Odds ratios and confidence intervals:
+
+```{r}
+
+kable(tidy(mod_final, exponentiate = TRUE, conf.int = TRUE))
+```
+
+## Prediction Plot
+
+Create prediction data:
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+newdata <- expand.grid(
+  log_B = seq(min(cells_model$log_B), max(cells_model$log_B), length.out = 100),
+  stage2 = levels(cells_model$stage2)
+)
+
+newdata$pred <- predict(mod_final, newdata, type = "response")
+
+```
+
+```{r}
+ggplot(newdata, aes(x = log_B, y = pred, color = stage2)) +
+  geom_line(size = 1.2) +
+  theme_minimal() +
+  labs(
+    title = "Predicted probability of response by B-cell abundance",
+    x = "Log-transformed B-cell count",
+    y = "Predicted probability of response",
+    color = "Tumor stage"
+  ) 
+```
+
+## Interpretation
+
+A logistic regression model was fitted to assess the association between B-cell abundance and treatment response to immunotherapy, while adjusting for tumor stage (early stages (I–III) vs late stage (IV)).
+
+Higher B-cell abundance was associated with increased odds of response (OR = 2.34, 95% CI: 0.90–7.19), although this association did not reach statistical significance (p = 0.105).
+
+Patients with stage IV disease showed lower odds of response compared to those with stage I–III tumors (OR = 0.45, 95% CI: 0.09–2.22), but this effect was also not statistically significant (p = 0.314).
+
+## Discussion
+
+Although not statistically significant, the observed trend suggests that higher B-cell abundance may be associated with improved response to immunotherapy. However, the small sample size and limited number of early-stage patients reduce statistical power and precision. Keep in mind that we only looked at one out of 11 patient cohorts included in the original study.
+
+Our analysis of cohort 11 is limited by the small sample size and imbalance in tumor stage distribution, which may lead to unstable estimates and reduced ability to detect significant associations.
+
+## Appendix: Data exploration plots with stage2 from start
+
+#### Does stage influence B cell count
+
+```{r}
+cells_model %>%
+  filter(!is.na(stage2), !is.na(B_count)) %>%
+  ggplot(aes(x = stage2, y = B_count)) +
+  geom_boxplot(fill = "lightgreen") +
+  geom_jitter(width = 0.2, alpha = 0.6) +
+  theme_minimal() 
+```
+
+#### Does stage influence response
+
+```{r}
+cells_clean2 <- cells_model %>%
+  filter(!is.na(stage2), !is.na(responder))
+counts <- cells_clean2 %>%
+  count(stage2)
+ggplot(cells_clean2, aes(x = stage2, fill = responder)) +
+  geom_bar(position = "fill") +
+  geom_text(
+    data = counts,
+    aes(x = stage2, y = 1.05, label = paste0("n=", n)),
+    inherit.aes = FALSE
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  labs( x = "Tumor stage", y = "Percentage of patients", fill = "Response Group") +
+  theme_minimal() 
+  
+```

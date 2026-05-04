@@ -1,0 +1,489 @@
+---
+title: "Cohort 11 — B-cell abundance as predictor of ICB response in HNSCC "
+author: "Marie Wyrsch"
+date: today
+
+toc: true
+abstract: "Reproducing and extending: Chang et al. (2025), Annals of Oncology,  DOI: https://doi.org/10.1016/j.annonc.2024.09.014"
+
+format:
+  html:
+    embed-resources: true #this creates a clean HTML file
+    number-sections: true #sections are numbered
+    code-fold: show #hide or show code 
+
+editor: visual
+editor_options:
+  chunk_output_type: console
+
+execute:
+  warning: false
+  message: false
+---
+
+## Introduction
+
+For our reproducibility study we used the following variables:
+
+- Predictor: B_cell_abundance (B cells as % of PBMCs, flow cytometry)
+
+- Outcome: best_response (CR/PR = responder; SD/PD = non-responder)
+
+- Confounder: tnm_stage (IV vs non-IV; model 2 only)
+
+- Method: Firth penalized logistic regression (due to complete separation)
+
+```{r}
+#| label: load-and-prepare-data
+#| output: false
+#| code-fold: false
+
+
+
+#loading of libraries ----------------------------------------------------------------
+library(readxl)
+library(brglm2)   # Firth penalized logistic regression
+library(pROC)     # ROC curves and AUC
+   
+
+
+#import data -------------------------------------------------------------------------
+library(readxl)
+
+path <- "/Users/mariewyrsch/Documents/UZH/BME321/mini_project/BME321-Mini-Project/Data_of_in-house_cohorts.xlsx"
+
+print(file.exists(path))
+print(readxl::excel_sheets(path))
+
+df <- readxl::read_excel(
+  path,
+  sheet = "Cohort11",
+  skip = 1
+)
+
+head(df)
+colnames(df)
+```
+
+The relevant columns (adjust names if your read produces different strings):
+
+- Flow B Cells Count: raw B-cell count from flow cytometry
+
+- Flow Lymphocytes Count: lymphocyte count
+
+- Flow Monocytes Count: monocyte count
+
+- Best response: RECIST response category
+
+- TNM stage: clinical TNM stage
+
+## Compute B-Cell abundance
+
+For the computation the definition in the paper was followed
+
+Definition (per paper): B cells / (lymphocytes + monocytes) \* 100
+
+```{r}
+#| label: computing-b-cell-abundandce
+#| output: true
+
+
+df$B_cell_abundance <- df[["Flow B Cells Count"]] /
+  (df[["Flow Lymphocytes Count"]] + df[["Flow Monocytes Count"]]) * 100
+
+summary(df$B_cell_abundance)
+```
+
+```{r}
+#| label: computing-t-cell-abundance
+#| output: true
+
+df$t_cell_abundance <- (df[["Flow T CD4+ Count"]] + df[["Flow T CD8+ Count"]]) /
+  df[["Flow Lymphocytes Count"]]
+summary(df$t_cell_abundance)
+```
+
+## Binarize Outcome
+
+The next step was also done according to the paper. The outcome variables is binarized as followed: CR or PR = responder (1), SD or PD = non-responder (0)
+
+The expected outcome was: 8 responders, 52 non-responders
+
+And after binarizing it was checked whether there were no responders below the threshold of B-Cell abundance below 5.5%.
+
+```{r}
+#| lable: binarizing-outcome
+#| output: true
+#| code-fold: true
+
+df$best_response <- ifelse(
+  df[["Best response"]] == "CR" | df[["Best response"]] == "PR",
+  1,
+  0
+)
+table(df$best_response)
+# Expected: 8 responders, 52 non-responders
+
+# Cross-check with 5.5% threshold from paper (should show 0 responders below)
+table(
+  "B >= 5.5%" = df$B_cell_abundance >= 5.5,
+  "Responder" = df$best_response
+)
+```
+
+## Collapse TNM stage
+
+```{r}
+#| label: TNM-stage-distribution
+#| output: true
+#| echo: false
+
+tnm_counts <- df %>%
+  count(`TNM stage`, name = "n")
+
+tnm_counts$`TNM stage` <- factor(
+  tnm_counts$`TNM stage`,
+  levels = c("I", "II", "IIA", "III", "IVA", "IVB", "IVC", "IV")
+)
+
+ggplot(tnm_counts, aes(x = n, y = `TNM stage`)) +
+  geom_col(width = 0.4, fill = "#0F7C7B") +
+  geom_text(aes(label = n), hjust = -0.5, size = 5, color = "#2E3A4D") +
+  scale_x_continuous(
+    limits = c(0, max(tnm_counts$n) + 2),
+    breaks = seq(0, max(tnm_counts$n) + 2, by = 5),
+    expand = c(0, 0)
+  ) +
+  labs(
+    title = "TNM Stage Distribution",
+    x = "Number of patients",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#1F2A44"),
+    axis.text = element_text(color = "#2E3A4D", size = 14),
+    axis.title.x = element_text(color = "black", size = 13),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_line(color = "#DDE3EA"),
+    axis.line = element_line(color = "gray50"),
+    axis.ticks = element_line(color = "gray50"),
+    panel.background = element_rect(fill = "#F3F7F8", color = NA),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+```
+
+TNM stages were collapsed/grouped as follows:
+
+- stage IV (any subtype) = 1
+
+- non-IV = 0
+
+Reason for this decision was the fact that 57 out of 60 patients are stage III-IV and with that too few per level for a multi-level factor with only 8 responders due to risk of overfitting.
+
+```{r}
+#| label: collapse-tnm-stage
+#| output: true
+
+df$tnm_stage_IV <- as.integer(grepl("^IV", df[["TNM stage"]]))
+
+df$tnm_stage_IV <- ifelse(
+  grepl("^IV", df[["TNM stage"]]),
+  1,
+  0
+)
+
+table(df[["TNM stage"]], df$tnm_stage_IV, useNA = "ifany")
+
+# 3 patients have missing TNM stage — excluded from model 2
+
+```
+
+## Separation Check
+
+Standard logistic regression fails when a predictor perfectly separates the outcome. Here all 8 responders have B_cell_abundance \> 5.5%.
+
+```{r}
+#| lable: fig-separation-check
+#| fig-cap: "B-Cell abundance by response group"
+#| output: true
+
+par(mar = c(5, 5, 4, 2))
+
+boxplot(
+  B_cell_abundance ~ best_response,
+  data   = df,
+  names  = c("Non-responders", "Responders"),
+  ylab   = "B-cell abundance (% of PBMCs)",
+  main   = "B-cell abundance by response group",
+  col    = c("lightcoral", "lightblue")
+)
+
+stripchart(
+  B_cell_abundance ~ best_response,
+  data   = df,
+  method = "jitter", jitter = 0.08,
+  vertical = TRUE, add = TRUE,
+  pch = 16, col = c("lightcoral", "lightblue"), cex = 0.8
+)
+
+abline(h = 5.5, lty = 2, col = "gray50")
+```
+
+```{r}
+#| label: distributional-statistics_response
+#| output: true
+library(dplyr)
+
+df %>%
+  group_by(best_response) %>%
+  summarise(
+    n = n(),
+    mean = mean(B_cell_abundance, na.rm = TRUE),
+    sd = sd(B_cell_abundance, na.rm = TRUE),
+    median = median(B_cell_abundance, na.rm = TRUE),
+    IQR = IQR(B_cell_abundance, na.rm = TRUE),
+    min = min(B_cell_abundance, na.rm = TRUE),
+    max = max(B_cell_abundance, na.rm = TRUE)
+  )
+
+df$below_5_5 <- df$B_cell_abundance < 5.5
+
+df %>%
+  group_by(best_response) %>%
+  summarise(
+    n_total = n(),
+    n_below = sum(below_5_5, na.rm = TRUE),
+    pct_below = 100 * mean(below_5_5, na.rm = TRUE)
+  )
+
+
+
+```
+
+```{r}
+#| label: fig-t-cell-separation
+#| fig-cap: "T-cell abundance by response group"
+
+boxplot(
+  t_cell_abundance ~ best_response,
+  data   = df,
+  names  = c("Non-responders", "Responders"),
+  ylab   = "T-cell abundance abundance (% of PBMCs)",
+  main   = "T-cell abundance by response group",
+  col    = c("lightcoral", "lightblue")
+)
+
+stripchart(
+  t_cell_abundance ~ best_response,
+  data   = df,
+  method = "jitter", jitter = 0.08,
+  vertical = TRUE, add = TRUE,
+  pch = 16, col = c("lightcoral", "lightblue"), cex = 0.8
+)
+```
+
+## Model 1 - Univariate Firth logistic regression (reproduce paper)
+
+If a predictor perfectly predicts the outcome:
+
+- Example: all patients with a biomarker = 1 have the event, none without it do
+
+```{r}
+#| label: model-1
+#| code-fold: false
+model1 <- glm(
+  best_response ~ B_cell_abundance,
+  data   = df,
+  family = binomial(link = "logit"),
+  method = "brglmFit"             # Firth penalization via brglm2
+)
+
+summary(model1)
+exp(coef(model1))                 # odds ratios
+exp(confint(model1))              # 95% CI on odds ratios
+
+# ROC curve and AUC
+roc1 <- roc(
+  response  = df$best_response,
+  predictor = fitted(model1),
+  ci        = TRUE,
+  quiet     = TRUE
+)
+
+cat("Model 1 — Univariate AUC:", round(auc(roc1), 4), "\n")
+cat("95% CI:", round(ci(roc1)[1], 4), "–", round(ci(roc1)[3], 4), "\n")
+# Target from paper: AUC ≈ 0.73
+```
+
+```{r}
+#| label: model_t_cell
+t_model <- glm(
+  best_response ~ t_cell_abundance,
+  data   = df,
+  family = binomial(link = "logit"),
+  method = "brglmFit"             # Firth penalization via brglm2
+)
+
+summary(t_model)
+exp(coef(t_model))                 # odds ratios
+exp(confint(t_model))              # 95% CI on odds ratios
+
+# ROC curve and AUC
+roct <- roc(
+  response  = df$best_response,
+  predictor = fitted(t_model),
+  ci        = TRUE,
+  quiet     = TRUE
+)
+
+cat("T-Cell Model — Univariate AUC:", round(auc(roct), 4), "\n")
+cat("95% CI:", round(ci(roct)[1], 4), "–", round(ci(roct)[3], 4), "\n")
+# Target from paper: AUC ≈ 0.73
+```
+
+## Model 2 - adjusted for TNM
+
+```{r}
+#| label: model-2
+#| code-fold: false
+
+df_complete <- df[!is.na(df[["TNM stage"]]), ]   # n = 57 (3 missing TNM)
+cat("n for adjusted model:", nrow(df_complete), "\n")
+
+model2 <- glm(
+  best_response ~ B_cell_abundance + tnm_stage_IV,
+  data   = df_complete,
+  family = binomial(link = "logit"),
+  method = "brglmFit"
+)
+
+summary(model2)
+exp(coef(model2))
+exp(confint(model2))
+
+roc2 <- roc(
+  response  = df_complete$best_response,
+  predictor = fitted(model2),
+  ci        = TRUE,
+  quiet     = TRUE
+)
+
+cat("Model 2 — Adjusted AUC:", round(auc(roc2), 4), "\n")
+cat("95% CI:", round(ci(roc2)[1], 4), "–", round(ci(roc2)[3], 4), "\n")
+
+```
+
+## Compare AUCs
+
+For the comparison a DeLong's test was used as in the paper.
+
+Note that the models use different n (60 vs 57) because of that the comparison was made on shared complete cases.
+
+```{r}
+#| label: compare-AUC
+#| output: true
+
+
+model1b <- glm(
+  best_response ~ B_cell_abundance,
+  data   = df_complete,
+  family = binomial(link = "logit"),
+  method = "brglmFit"
+)
+roc1b <- roc(df_complete$best_response, fitted(model1b), quiet = TRUE)
+
+roc_comparison <- roc.test(roc1b, roc2, method = "delong")
+print(roc_comparison)
+```
+
+```{r}
+#| label: fig-auc-compare
+#| output: true
+#| echo: false
+
+
+auc_df <- tibble(
+  model = c("Our + TNM adj.", "Our univariate", "Paper (Fig 4D)"),
+  auc = c(
+    auc(roc2),
+    auc(roc1),
+    0.73  # paper value 
+  )
+)
+
+ggplot(auc_df, aes(x = auc, y = model, fill = model)) +
+  geom_col(width = 0.4) +
+  geom_text(aes(label = sprintf("%.3f", auc)), hjust = -0.2) +
+  scale_fill_manual(values = c(
+    "Our + TNM adj." = "lightcoral",
+    "Our univariate" = "lightblue",
+    "Paper (Fig 4D)" = "#5D6D7E"
+  )) +
+  coord_cartesian(xlim = c(0.5, 0.85)) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+## Plot ROC curves
+
+```{r}
+#| label: fig-plot-roc-curves
+#| output: true
+
+par(mar = c(5, 4, 3, 2))
+
+plot(
+  roc1,
+  col  = "lightblue",
+  lwd  = 2,
+  xlab = "1 - Specificity",
+  ylab = "Sensitivity"
+)
+
+plot(
+  roc2,
+  col  = "lightcoral",
+  lwd  = 2,
+  lty  = 2,
+  add  = TRUE
+)
+
+plot(
+  roct,
+  col  = "lightgreen",
+  lwd  = 2,
+  lty = 2,
+  add = TRUE
+)
+
+abline(a = 0, b = 1, lty = 3, col = "gray60")
+
+legend(
+  "bottomright",
+  legend = c(
+    paste0("Univariate  (AUC = ", round(auc(roc1),  3), ")"),
+    paste0("+ TNM stage (AUC = ", round(auc(roc2),  3), ")"),
+    paste0("Univariate T-Cell (AUC =", round(auc(roct), 3), ")"),
+    "Random (AUC = 0.500)"
+  ),
+  col    = c("lightblue", "lightcoral", "lightgreen", "gray60"),
+  lty    = c(1, 2, 2, 3),
+  lwd    = c(2, 2,2, 1),
+  bty    = "n",
+  cex    = 0.85
+)
+
+```
+
+## Session Info
+
+```{r}
+#| label: session-info
+#| output: true
+
+
+sessionInfo()
+```
